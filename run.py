@@ -1,57 +1,154 @@
-import requests
+import argparse
 import os
-from bs4 import BeautifulSoup
 from queue import Queue
 from threading import Thread
-from multiprocessing import Process,Queue
-base_url = "域名/.git/"
-q = Queue(maxsize=99999)
-# 爬取根域名
-q.put("")
+from urllib.parse import urljoin, urlparse
 
-def file_tree():
-    global q
-    while not q.empty():
-        path = q.get()
-        url = "%s%s"%(base_url,path)
-        print("file tree:%s" % url)
-        res = requests.get(url)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for t in soup.find_all('a'):
-            href = t.attrs["href"]
-            if href == "../":
-                print("../ continue")
+import requests
+from bs4 import BeautifulSoup
+
+
+def normalize_git_url(url: str) -> str:
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+
+    if not url.rstrip("/").endswith(".git"):
+        url = url.rstrip("/") + "/.git"
+
+    return url.rstrip("/") + "/"
+
+
+def safe_join(base_dir: str, relative_path: str) -> str:
+    target = os.path.abspath(os.path.join(base_dir, relative_path))
+    base = os.path.abspath(base_dir)
+
+    if not target.startswith(base):
+        raise ValueError(f"unsafe path: {relative_path}")
+
+    return target
+
+
+def should_skip_existing(file_path: str) -> bool:
+    if not os.path.exists(file_path):
+        return False
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = f.read()
+        return "系统发生错误" not in data
+    except UnicodeDecodeError:
+        return True
+
+
+def download_file(session: requests.Session, file_url: str, file_path: str, timeout: int) -> None:
+    if should_skip_existing(file_path):
+        print(f"skip existing: {file_path}")
+        return
+
+    try:
+        r = session.get(file_url, timeout=timeout)
+    except requests.RequestException as e:
+        print(f"request error: {file_url} - {e}")
+        return
+
+    if r.status_code != 200:
+        print(f"download error [{r.status_code}]: {file_url}")
+        return
+
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with open(file_path, "wb") as f:
+        f.write(r.content)
+
+    print(f"download: {file_path}")
+
+
+def worker(queue: Queue, base_url: str, output_dir: str, timeout: int) -> None:
+    session = requests.Session()
+
+    while True:
+        path = queue.get()
+
+        if path is None:
+            queue.task_done()
+            break
+
+        url = urljoin(base_url, path)
+        print(f"file tree: {url}")
+
+        try:
+            res = session.get(url, timeout=timeout)
+        except requests.RequestException as e:
+            print(f"request error: {url} - {e}")
+            queue.task_done()
+            continue
+
+        if res.status_code != 200:
+            print(f"tree error [{res.status_code}]: {url}")
+            queue.task_done()
+            continue
+
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        for tag in soup.find_all("a"):
+            href = tag.get("href")
+            if not href or href == "../":
                 continue
+
+            if href.startswith(("http://", "https://", "?")):
+                continue
+
+            child_path = path + href
+
             if href.endswith("/"):
-                q.put("%s%s"%(path,href))
-            else:
-                file_url = "%s%s" % (url, href)
-                dir_path = os.path.join('create/.git/',path)
-                file_path = os.path.join(dir_path,href)
-                if os.path.exists(file_path):
-                    try:
-                        with open(file_path,"r") as f:
-                            data = f.read()
-                            if "系统发生错误" in data:
-                                continue
-                    except UnicodeDecodeError:
-                        pass
+                queue.put(child_path)
+                continue
 
-                r = requests.get(file_url)
-                if r.status_code != 200:
-                    print("error:%s"% file_url)
-                if not os.path.exists(os.path.join('create',path)):
-                    os.makedirs(os.path.join('create',path))
-                print("download %s" % file_path)
-                with open(file_path, 'wb') as f:
-                    f.write(r.content)
+            file_url = urljoin(url, href)
+            file_path = safe_join(output_dir, child_path)
+            download_file(session, file_url, file_path, timeout)
+
+        queue.task_done()
 
 
-q = file_tree()
-pool = []
-for i in range(16):
-    pool.append(Thread(target=file_tree))
-for i in pool:
-    i.start()
-for i in pool:
-    i.join()
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download files from an exposed .git directory. Use only on authorized targets."
+    )
+    parser.add_argument("url", help="target .git URL, e.g. https://example.com/.git/")
+    parser.add_argument("-o", "--output", default="create/.git", help="output directory")
+    parser.add_argument("-t", "--threads", type=int, default=16, help="worker threads")
+    parser.add_argument("--timeout", type=int, default=10, help="request timeout seconds")
+
+    args = parser.parse_args()
+
+    base_url = normalize_git_url(args.url)
+    output_dir = os.path.abspath(args.output)
+
+    parsed = urlparse(base_url)
+    if not parsed.netloc:
+        raise SystemExit(f"invalid URL: {args.url}")
+
+    queue = Queue()
+    queue.put("")
+
+    threads = []
+    for _ in range(args.threads):
+        t = Thread(target=worker, args=(queue, base_url, output_dir, args.timeout), daemon=True)
+        t.start()
+        threads.append(t)
+
+    queue.join()
+
+    for _ in threads:
+        queue.put(None)
+
+    for t in threads:
+        t.join()
+
+    print(f"done: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
